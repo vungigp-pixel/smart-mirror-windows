@@ -22,6 +22,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterator
 
 
 SCHEMA_VERSION = 1
@@ -50,6 +51,16 @@ def utc_now() -> str:
 
 def path_key(path: str) -> str:
     return path.replace("/", "\\").strip("\\").casefold()
+
+
+def ancestor_path_keys(key: str) -> Iterator[str]:
+    """Yield parent path keys from nearest to farthest in O(path depth)."""
+    end = len(key)
+    while True:
+        end = key.rfind("\\", 0, end)
+        if end < 0:
+            return
+        yield key[:end]
 
 
 def is_relative_to(path: Path, parent: Path) -> bool:
@@ -678,6 +689,9 @@ class MirrorEngine:
         source = self.db.present("A")
         replica = self.db.present("B")
         actions: list[tuple[str, sqlite3.Row | None, sqlite3.Row | None]] = []
+        source_by_depth = sorted(
+            source.items(), key=lambda item: item[1]["rel_path"].count(os.sep)
+        )
 
         # Rename/move before copy. Mapping survives source path changes.
         replica_by_origin = {
@@ -686,42 +700,44 @@ class MirrorEngine:
             if row["origin_file_id"] is not None
         }
         claimed_replica_keys: set[str] = set()
-        moved_directories: list[tuple[str, str]] = []
+        moved_directories: dict[str, str] = {}
+        moved_source_ids: set[int] = set()
         covered_source_keys: set[str] = set()
-        for key, src in sorted(
-            source.items(), key=lambda item: item[1]["rel_path"].count(os.sep)
-        ):
+        for key, src in source_by_depth:
             if not src["rel_path"]:
                 continue
             dst = replica.get(key)
             old = replica_by_origin.get(src["file_id"])
             if dst is None and old and old["path_key"] != key:
-                covered = any(
-                    key.startswith(new_prefix + "\\")
-                    and old["path_key"].startswith(old_prefix + "\\")
-                    for new_prefix, old_prefix in moved_directories
-                )
+                covered = False
+                for parent_key in ancestor_path_keys(key):
+                    old_parent_key = moved_directories.get(parent_key)
+                    if old_parent_key and old["path_key"].startswith(old_parent_key + "\\"):
+                        covered = True
+                        break
                 if covered:
                     covered_source_keys.add(key)
                     claimed_replica_keys.add(old["path_key"])
                     continue
                 actions.append(("move", src, old))
+                moved_source_ids.add(src["file_id"])
                 claimed_replica_keys.add(old["path_key"])
                 if src["is_dir"]:
-                    moved_directories.append((key, old["path_key"]))
+                    moved_directories[key] = old["path_key"]
 
-        for key, src in sorted(source.items(), key=lambda item: item[1]["rel_path"].count(os.sep)):
+        for key, src in source_by_depth:
             if not src["rel_path"]:
                 continue
-            if key in covered_source_keys or any(
-                key.startswith(new_prefix + "\\") for new_prefix, _ in moved_directories
-            ):
+            under_moved_directory = any(
+                parent_key in moved_directories for parent_key in ancestor_path_keys(key)
+            )
+            if key in covered_source_keys or under_moved_directory:
                 # A parent directory move updates this subtree in the database.
                 # A subsequent planning round handles content changes inside it.
                 continue
             dst = replica.get(key)
             if dst is None:
-                if not any(action == "move" and action_src["file_id"] == src["file_id"] for action, action_src, _ in actions):
+                if src["file_id"] not in moved_source_ids:
                     actions.append(("mkdir" if src["is_dir"] else "copy", src, None))
             elif bool(src["is_dir"]) != bool(dst["is_dir"]):
                 actions.append(("replace_type", src, dst))
@@ -763,17 +779,30 @@ class MirrorEngine:
                 self.reconcile()
                 self.db.set_meta("reconcile_required", "0")
         totals = {"planned": 0, "completed": 0, "failed": 0}
-        for _round in range(10):
+        for round_number in range(1, 11):
+            planning_started = time.monotonic()
+            logging.info("Planning synchronization actions (round %d)...", round_number)
             actions = self.plan()
+            planning_seconds = time.monotonic() - planning_started
             totals["planned"] += len(actions)
+            logging.info(
+                "Planning complete: %d actions in %.2f seconds",
+                len(actions),
+                planning_seconds,
+            )
             if not actions:
                 break
-            for action, src, dst in actions:
+            last_progress = time.monotonic()
+            for action_index, (action, src, dst) in enumerate(actions, start=1):
                 rel = src["rel_path"] if src else dst["rel_path"]
                 try:
                     if self.dry_run:
                         logging.info("DRY-RUN %-12s %s", action, rel)
                         continue
+                    if action_index == 1:
+                        logging.info(
+                            "Executing actions: 1/%d %s %s", len(actions), action, rel
+                        )
                     if action == "mkdir":
                         self._mkdir(src)
                     elif action == "copy":
@@ -793,6 +822,16 @@ class MirrorEngine:
                     totals["failed"] += 1
                     self.db.record(action, rel, "failed", repr(exc))
                     logging.exception("Failed %s: %s", action, rel)
+                now = time.monotonic()
+                if action_index == len(actions) or now - last_progress >= 10:
+                    logging.info(
+                        "Execution progress: %d/%d actions (completed=%d failed=%d)",
+                        action_index,
+                        len(actions),
+                        totals["completed"],
+                        totals["failed"],
+                    )
+                    last_progress = now
             if self.dry_run or totals["failed"]:
                 break
         else:

@@ -1,6 +1,7 @@
 import os
 import shutil
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -96,6 +97,41 @@ class MirrorEngineTests(unittest.TestCase):
         self.replica.mkdir()
         with self.assertRaisesRegex(RuntimeError, "root identity changed"):
             self.engine.sync()
+
+    def test_large_empty_replica_plan_does_not_degrade_quadratically(self):
+        root_a = {
+            "file_id": 1,
+            "origin_file_id": None,
+            "rel_path": "",
+            "path_key": "",
+            "is_dir": 1,
+            "size": 0,
+            "mtime_ns": 0,
+            "sha256": None,
+        }
+        root_b = dict(root_a)
+        source = {"": root_a}
+        replica = {"": root_b}
+        for index in range(20_000):
+            rel = f"folder\\file-{index:05d}.bin"
+            source[rel.casefold()] = {
+                "file_id": index + 2,
+                "origin_file_id": None,
+                "rel_path": rel,
+                "path_key": rel.casefold(),
+                "is_dir": 0,
+                "size": index,
+                "mtime_ns": index,
+                "sha256": None,
+            }
+        self.engine.db.present = lambda side: source if side == "A" else replica
+
+        started = time.perf_counter()
+        actions = self.engine.plan()
+        elapsed = time.perf_counter() - started
+
+        self.assertEqual(len(actions), 20_000)
+        self.assertLess(elapsed, 2.0, f"planning took {elapsed:.2f}s")
 
 
 if __name__ == "__main__":

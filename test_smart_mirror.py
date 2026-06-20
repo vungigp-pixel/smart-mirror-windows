@@ -4,8 +4,9 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from smart_mirror import Config, MirrorEngine
+from smart_mirror import Config, JournalState, MirrorEngine
 
 
 class MirrorEngineTests(unittest.TestCase):
@@ -132,6 +133,54 @@ class MirrorEngineTests(unittest.TestCase):
 
         self.assertEqual(len(actions), 20_000)
         self.assertLess(elapsed, 2.0, f"planning took {elapsed:.2f}s")
+
+    def test_usn_checkpoint_older_than_first_usn_requests_reconciliation(self):
+        self.engine.db.set_meta("A_journal_id", "7")
+        self.engine.db.set_meta("A_next_usn", "50")
+
+        class FakeJournal:
+            def __init__(self, _root):
+                pass
+
+            def state(self):
+                return JournalState(journal_id=7, first_usn=100, next_usn=200, lowest_valid_usn=0)
+
+            def close(self):
+                pass
+
+        with patch("smart_mirror.UsnJournal", FakeJournal):
+            changed = self.engine._ingest_side("A", self.source)
+
+        self.assertTrue(changed)
+        self.assertEqual(self.engine.db.get_meta("reconcile_required"), "1")
+        self.assertEqual(self.engine.db.get_meta("verify_all_required"), "1")
+
+    def test_deleted_usn_entry_error_requests_reconciliation(self):
+        self.engine.db.set_meta("B_journal_id", "9")
+        self.engine.db.set_meta("B_next_usn", "100")
+
+        class FakeJournal:
+            def __init__(self, _root):
+                pass
+
+            def state(self):
+                return JournalState(journal_id=9, first_usn=0, next_usn=200, lowest_valid_usn=0)
+
+            def record_batches(self, _start_usn, _journal_id):
+                error = OSError("journal entry deleted")
+                error.winerror = 1181
+                raise error
+                yield  # pragma: no cover
+
+            def close(self):
+                pass
+
+        with patch("smart_mirror.UsnJournal", FakeJournal):
+            changed = self.engine._ingest_side("B", self.replica)
+
+        self.assertTrue(changed)
+        self.assertEqual(self.engine.db.get_meta("reconcile_required"), "1")
+        self.assertEqual(self.engine.db.get_meta("verify_all_required"), "1")
 
 
 if __name__ == "__main__":

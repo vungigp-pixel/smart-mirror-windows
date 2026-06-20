@@ -36,6 +36,9 @@ Database chỉ là chỉ mục tăng tốc, không được coi là nguồn sự
 - Database, quarantine và log phải nằm ngoài source và replica.
 - File được copy vào file tạm, `fsync`, sau đó thay thế bằng `os.replace`.
 - File dư tại replica được move sang quarantine thay vì xóa ngay.
+- Replica được xem là vùng do chương trình quản lý. Trong khi `sync` đang chạy,
+  không chỉnh sửa trực tiếp replica; chương trình định kỳ bỏ qua các USN event
+  do chính nó vừa tạo để tránh journal đầy trong lần copy đầu.
 - SHA-256 được tính trong lượt copy hoặc khi cần xác minh nội dung.
 - Rename/move được nhận diện bằng NTFS file ID để tránh copy lại không cần thiết.
 - Nếu USN Journal reset hoặc wrap, chương trình ép đối soát có xác minh hash.
@@ -134,6 +137,10 @@ fsutil usn createjournal m=268435456 a=67108864 F:
 
 Ví dụ trên đặt kích thước tối đa 256 MB và allocation delta 64 MB cho mỗi ổ.
 Chế độ `run` yêu cầu journal đọc được trên cả source và replica.
+
+Nếu checkpoint cũ hơn `FirstUsn` hoặc Windows trả về lỗi 1181, chương trình tự
+đánh dấu journal đã wrap và chuyển sang đối soát có xác minh thay vì dừng bằng
+traceback.
 
 ## Các chế độ chạy
 

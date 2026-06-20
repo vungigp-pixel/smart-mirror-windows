@@ -43,6 +43,7 @@ USN_REASON_HASH_INVALIDATING = (
 )
 FSCTL_QUERY_USN_JOURNAL = 0x000900F4
 FSCTL_READ_USN_JOURNAL = 0x000900BB
+ERROR_JOURNAL_ENTRY_DELETED = 1181
 
 
 def utc_now() -> str:
@@ -506,15 +507,22 @@ class UsnJournal:
         journal_id, first, next_usn, lowest = struct.unpack_from("<Qqqq", raw)
         return JournalState(journal_id, first, next_usn, lowest)
 
-    def records(self, start_usn: int, journal_id: int) -> tuple[int, list[UsnRecord]]:
+    def record_batches(
+        self, start_usn: int, journal_id: int
+    ) -> Iterator[tuple[int, list[UsnRecord]]]:
+        """Yield at most one DeviceIoControl buffer at a time.
+
+        Incremental batches bound memory usage and let callers persist a new
+        checkpoint before reading the next portion of a busy journal.
+        """
         cursor = start_usn
-        records: list[UsnRecord] = []
         while True:
             request = struct.pack("<qIIQQQ", cursor, 0xFFFFFFFF, 0, 0, 0, journal_id)
             raw = self._ioctl(FSCTL_READ_USN_JOURNAL, request, 1024 * 1024)
             if len(raw) < 8:
-                break
+                return
             next_cursor = struct.unpack_from("<q", raw)[0]
+            records: list[UsnRecord] = []
             offset = 8
             while offset + 60 <= len(raw):
                 length, major = struct.unpack_from("<IH", raw, offset)
@@ -532,11 +540,10 @@ class UsnJournal:
                 else:
                     raise OSError(f"Unsupported USN record version: {major}")
                 offset += length
+            yield next_cursor, records
             if next_cursor <= cursor or len(raw) == 8:
-                cursor = next_cursor
-                break
+                return
             cursor = next_cursor
-        return cursor, records
 
 
 class MirrorEngine:
@@ -616,19 +623,61 @@ class MirrorEngine:
         try:
             journal = UsnJournal(root)
             state = journal.state()
-            if int(stored_id) != state.journal_id or int(stored_usn) < state.lowest_valid_usn:
-                logging.warning("%s USN journal reset or wrapped; forcing verified reconciliation", side)
-                self.db.set_meta("reconcile_required", "1")
-                self.db.set_meta("verify_all_required", "1")
+            minimum_readable_usn = max(state.first_usn, state.lowest_valid_usn)
+            if int(stored_id) != state.journal_id or int(stored_usn) < minimum_readable_usn:
+                self._mark_journal_gap(side)
                 return True
-            next_usn, records = journal.records(int(stored_usn), state.journal_id)
-            for record in records:
-                self._apply_usn(side, root, record)
-            self.db.conn.commit()
-            self.db.set_meta(f"{side}_next_usn", str(next_usn))
-            if records:
-                logging.info("Ingested %d USN records for %s", len(records), side)
-            return bool(records)
+            total_records = 0
+            try:
+                for next_usn, records in journal.record_batches(
+                    int(stored_usn), state.journal_id
+                ):
+                    for record in records:
+                        self._apply_usn(side, root, record)
+                    self.db.conn.commit()
+                    self.db.set_meta(f"{side}_next_usn", str(next_usn))
+                    total_records += len(records)
+                    if total_records and total_records % 100_000 < len(records):
+                        logging.info("Ingested %d USN records for %s...", total_records, side)
+            except OSError as exc:
+                if getattr(exc, "winerror", None) == ERROR_JOURNAL_ENTRY_DELETED:
+                    self._mark_journal_gap(side)
+                    return True
+                raise
+            if total_records:
+                logging.info("Ingested %d USN records for %s", total_records, side)
+            return bool(total_records)
+        finally:
+            if journal:
+                journal.close()
+
+    def _mark_journal_gap(self, side: str) -> None:
+        logging.warning(
+            "%s USN journal reset, wrapped, or deleted an unread entry; "
+            "forcing verified reconciliation",
+            side,
+        )
+        self.db.set_meta("reconcile_required", "1")
+        self.db.set_meta("verify_all_required", "1")
+
+    def _checkpoint_managed_replica_changes(self) -> None:
+        """Skip USN events produced by this process after DB updates commit.
+
+        The replica is program-managed. Advancing its cursor periodically keeps
+        a large initial copy from filling the journal with our own write events.
+        """
+        journal = None
+        try:
+            journal = UsnJournal(self.cfg.replica)
+            state = journal.state()
+            stored_id = self.db.get_meta("B_journal_id")
+            if stored_id is not None and int(stored_id) != state.journal_id:
+                self._mark_journal_gap("B")
+                return
+            self.db.set_meta("B_journal_id", str(state.journal_id))
+            self.db.set_meta("B_next_usn", str(state.next_usn))
+        except OSError as exc:
+            logging.warning("Could not checkpoint replica USN journal: %s", exc)
         finally:
             if journal:
                 journal.close()
@@ -831,6 +880,7 @@ class MirrorEngine:
                         totals["completed"],
                         totals["failed"],
                     )
+                    self._checkpoint_managed_replica_changes()
                     last_progress = now
             if self.dry_run or totals["failed"]:
                 break

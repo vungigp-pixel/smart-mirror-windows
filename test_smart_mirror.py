@@ -1,4 +1,3 @@
-import os
 import shutil
 import tempfile
 import time
@@ -64,14 +63,12 @@ class MirrorEngineTests(unittest.TestCase):
         self.assertFalse((self.replica / "old").exists())
         self.assertEqual((self.replica / "new" / "nested.txt").read_text(), "unchanged content")
 
-    def test_extra_replica_content_goes_to_quarantine(self):
+    def test_nonempty_unmanaged_replica_is_rejected(self):
         extra = self.replica / "not-in-source.bin"
         extra.write_bytes(b"do not delete permanently")
-        self.reconcile_and_sync()
-        self.assertFalse(extra.exists())
-        recovered = list(self.cfg.quarantine.rglob("not-in-source.bin"))
-        self.assertEqual(len(recovered), 1)
-        self.assertEqual(recovered[0].read_bytes(), b"do not delete permanently")
+        with self.assertRaisesRegex(RuntimeError, "Replica is not empty"):
+            self.engine.reconcile()
+        self.assertTrue(extra.exists())
 
     def test_dry_run_does_not_change_replica(self):
         (self.source / "planned.txt").write_text("planned", encoding="utf-8")
@@ -81,16 +78,45 @@ class MirrorEngineTests(unittest.TestCase):
         self.assertGreater(result["planned"], 0)
         self.assertFalse((self.replica / "planned.txt").exists())
 
-    def test_same_metadata_but_different_content_is_detected(self):
-        source_file = self.source / "collision.bin"
-        replica_file = self.replica / "collision.bin"
-        source_file.write_bytes(b"AAAA")
-        replica_file.write_bytes(b"BBBB")
-        timestamp_ns = 1_700_000_000_000_000_000
-        os.utime(source_file, ns=(timestamp_ns, timestamp_ns))
-        os.utime(replica_file, ns=(timestamp_ns, timestamp_ns))
+    def test_reconcile_does_not_scan_external_replica_content(self):
+        source_file = self.source / "managed.bin"
+        source_file.write_bytes(b"managed")
         self.reconcile_and_sync()
-        self.assertEqual(replica_file.read_bytes(), b"AAAA")
+        external = self.replica / "external.bin"
+        external.write_bytes(b"not in managed manifest")
+
+        self.engine.reconcile()
+
+        self.assertTrue(external.exists())
+        self.assertIsNone(self.engine.db.by_path("B", "external.bin"))
+
+    def test_existing_replica_manifest_is_preserved_during_migration(self):
+        source_file = self.source / "existing.bin"
+        replica_file = self.replica / "existing.bin"
+        source_file.write_bytes(b"already synchronized")
+        replica_file.write_bytes(b"already synchronized")
+        self.engine.db.upsert_path("B", self.replica, self.replica)
+        self.engine.db.upsert_path(
+            "B",
+            self.replica,
+            replica_file,
+            origin_file_id=source_file.stat().st_ino,
+        )
+        self.engine.db.set_meta("B_journal_id", "legacy-id")
+        self.engine.db.set_meta("B_next_usn", "12345")
+        self.engine.db.conn.commit()
+
+        self.engine.reconcile()
+
+        row = self.engine.db.by_path("B", "existing.bin")
+        self.assertIsNotNone(row)
+        self.assertEqual(row["size"], len(b"already synchronized"))
+        self.assertEqual(
+            self.engine.db.get_meta("replica_tracking_mode"),
+            "managed_expected_state",
+        )
+        self.assertIsNone(self.engine.db.get_meta("B_journal_id"))
+        self.assertIsNone(self.engine.db.get_meta("B_next_usn"))
 
     def test_replaced_replica_root_is_rejected(self):
         self.engine.reconcile()
@@ -155,16 +181,16 @@ class MirrorEngineTests(unittest.TestCase):
         self.assertEqual(self.engine.db.get_meta("reconcile_required"), "1")
         self.assertEqual(self.engine.db.get_meta("verify_all_required"), "1")
 
-    def test_deleted_usn_entry_error_requests_reconciliation(self):
-        self.engine.db.set_meta("B_journal_id", "9")
-        self.engine.db.set_meta("B_next_usn", "100")
+    def test_deleted_source_usn_entry_error_requests_reconciliation(self):
+        self.engine.db.set_meta("A_journal_id", "11")
+        self.engine.db.set_meta("A_next_usn", "100")
 
         class FakeJournal:
             def __init__(self, _root):
                 pass
 
             def state(self):
-                return JournalState(journal_id=9, first_usn=0, next_usn=200, lowest_valid_usn=0)
+                return JournalState(journal_id=11, first_usn=0, next_usn=200, lowest_valid_usn=0)
 
             def record_batches(self, _start_usn, _journal_id):
                 error = OSError("journal entry deleted")
@@ -176,11 +202,35 @@ class MirrorEngineTests(unittest.TestCase):
                 pass
 
         with patch("smart_mirror.UsnJournal", FakeJournal):
-            changed = self.engine._ingest_side("B", self.replica)
+            changed = self.engine._ingest_side("A", self.source)
 
         self.assertTrue(changed)
         self.assertEqual(self.engine.db.get_meta("reconcile_required"), "1")
         self.assertEqual(self.engine.db.get_meta("verify_all_required"), "1")
+
+    def test_ingest_journals_never_opens_replica_journal(self):
+        self.engine.db.set_meta("A_journal_id", "9")
+        self.engine.db.set_meta("A_next_usn", "100")
+        opened_roots = []
+
+        class FakeJournal:
+            def __init__(self, root):
+                opened_roots.append(root)
+
+            def state(self):
+                return JournalState(journal_id=9, first_usn=0, next_usn=200, lowest_valid_usn=0)
+
+            def record_batches(self, _start_usn, _journal_id):
+                yield 200, []
+
+            def close(self):
+                pass
+
+        with patch("smart_mirror.UsnJournal", FakeJournal):
+            changed = self.engine.ingest_journals()
+
+        self.assertFalse(changed)
+        self.assertEqual(opened_roots, [self.source])
 
 
 if __name__ == "__main__":

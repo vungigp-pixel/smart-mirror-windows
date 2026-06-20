@@ -565,20 +565,14 @@ class MirrorEngine:
 
     def reconcile(self) -> None:
         self._validate_roots(initial=True)
-        logging.info("Full reconciliation scan started")
+        self._initialize_managed_replica_state()
+        logging.info("Source reconciliation scan started (replica scan disabled)")
         verify_all = self.db.get_meta("verify_all_required") == "1"
         source_cursor = self._journal_next(self.cfg.source)
-        replica_cursor = self._journal_next(self.cfg.replica)
         a_count = self.db.scan(
             "A",
             self.cfg.source,
             self._absolute_excludes(self.cfg.source),
-            invalidate_hashes=verify_all,
-        )
-        b_count = self.db.scan(
-            "B",
-            self.cfg.replica,
-            self._absolute_excludes(self.cfg.replica),
             invalidate_hashes=verify_all,
         )
         self.db.bind_origins_by_path()
@@ -589,12 +583,43 @@ class MirrorEngine:
         if source_cursor:
             self.db.set_meta("A_journal_id", str(source_cursor[0]))
             self.db.set_meta("A_next_usn", str(source_cursor[1]))
-        if replica_cursor:
-            self.db.set_meta("B_journal_id", str(replica_cursor[0]))
-            self.db.set_meta("B_next_usn", str(replica_cursor[1]))
-        logging.info("Full scan complete: source=%d replica=%d", a_count, b_count)
+        logging.info("Source scan complete: source=%d", a_count)
         # Capture changes that occurred while the scan was in progress.
         self.ingest_journals()
+
+    def _initialize_managed_replica_state(self) -> None:
+        """Create an empty expected-state manifest without scanning replica.
+
+        Existing B rows are preserved for migration from the journal-tracked
+        implementation. A fresh database may only adopt an empty replica.
+        """
+        root_row = self.db.by_path("B", "")
+        any_b_row = self.db.conn.execute(
+            "SELECT 1 FROM nodes WHERE side='B' AND present=1 LIMIT 1"
+        ).fetchone()
+        if root_row:
+            self._mark_replica_as_managed()
+            return
+        if any_b_row:
+            raise RuntimeError("Replica manifest is corrupt: entries exist without a root row")
+        with os.scandir(self.cfg.replica) as entries:
+            if next(entries, None) is not None:
+                raise RuntimeError(
+                    "Replica is not empty but has no managed manifest. "
+                    "Use an empty replica or migrate an existing database."
+                )
+        self.db.upsert_path("B", self.cfg.replica, self.cfg.replica)
+        self.db.conn.commit()
+        self._mark_replica_as_managed()
+
+    def _mark_replica_as_managed(self) -> None:
+        # Remove legacy F: journal cursors so the database clearly records that
+        # B is expected state, not a volume-journal-backed filesystem snapshot.
+        self.db.conn.execute(
+            "DELETE FROM meta WHERE key IN ('B_journal_id','B_next_usn')"
+        )
+        self.db.conn.commit()
+        self.db.set_meta("replica_tracking_mode", "managed_expected_state")
 
     def _journal_next(self, root: Path) -> tuple[int, int] | None:
         try:
@@ -609,10 +634,9 @@ class MirrorEngine:
             return None
 
     def ingest_journals(self) -> bool:
-        changed = False
-        for side, root in (("A", self.cfg.source), ("B", self.cfg.replica)):
-            changed = self._ingest_side(side, root) or changed
-        return changed
+        # B is a managed expected-state manifest. It is updated transactionally
+        # after successful operations and never reads the volume-wide F: journal.
+        return self._ingest_side("A", self.cfg.source)
 
     def _ingest_side(self, side: str, root: Path) -> bool:
         stored_id = self.db.get_meta(f"{side}_journal_id")
@@ -659,28 +683,6 @@ class MirrorEngine:
         )
         self.db.set_meta("reconcile_required", "1")
         self.db.set_meta("verify_all_required", "1")
-
-    def _checkpoint_managed_replica_changes(self) -> None:
-        """Skip USN events produced by this process after DB updates commit.
-
-        The replica is program-managed. Advancing its cursor periodically keeps
-        a large initial copy from filling the journal with our own write events.
-        """
-        journal = None
-        try:
-            journal = UsnJournal(self.cfg.replica)
-            state = journal.state()
-            stored_id = self.db.get_meta("B_journal_id")
-            if stored_id is not None and int(stored_id) != state.journal_id:
-                self._mark_journal_gap("B")
-                return
-            self.db.set_meta("B_journal_id", str(state.journal_id))
-            self.db.set_meta("B_next_usn", str(state.next_usn))
-        except OSError as exc:
-            logging.warning("Could not checkpoint replica USN journal: %s", exc)
-        finally:
-            if journal:
-                journal.close()
 
     def _apply_usn(self, side: str, root: Path, record: UsnRecord) -> None:
         if record.reason & USN_REASON_RENAME_OLD_NAME:
@@ -819,6 +821,7 @@ class MirrorEngine:
     def sync(self) -> dict[str, int]:
         self._ensure_initialized()
         self._validate_roots()
+        self._initialize_managed_replica_state()
         if self.db.get_meta("reconcile_required") == "1":
             self.reconcile()
             self.db.set_meta("reconcile_required", "0")
@@ -880,7 +883,6 @@ class MirrorEngine:
                         totals["completed"],
                         totals["failed"],
                     )
-                    self._checkpoint_managed_replica_changes()
                     last_progress = now
             if self.dry_run or totals["failed"]:
                 break
@@ -1033,10 +1035,10 @@ class MirrorEngine:
 
     def run_forever(self) -> None:
         self._ensure_initialized()
-        if self.db.get_meta("A_next_usn") is None or self.db.get_meta("B_next_usn") is None:
+        if self.db.get_meta("A_next_usn") is None:
             raise RuntimeError(
-                "Continuous mode requires readable NTFS USN journals on both volumes. "
-                "Run as Administrator and verify that source/replica are NTFS."
+                "Continuous mode requires a readable NTFS USN journal on source. "
+                "Run as Administrator and verify that source is NTFS."
             )
         while True:
             try:
@@ -1104,6 +1106,10 @@ def main() -> int:
                         "last_full_scan": engine.db.get_meta("last_full_scan"),
                         "source_entries": len(engine.db.present("A")),
                         "replica_entries": len(engine.db.present("B")),
+                        "replica_tracking_mode": engine.db.get_meta(
+                            "replica_tracking_mode"
+                        )
+                        or "legacy_or_uninitialized",
                         "planned_actions": len(engine.plan()),
                         "reconcile_required": engine.db.get_meta("reconcile_required") == "1",
                     },

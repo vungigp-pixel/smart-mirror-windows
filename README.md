@@ -8,9 +8,9 @@ source (chỉ đọc) ──────────────> replica (đư�
                                   └── file dư/xóa → quarantine
 ```
 
-Chương trình dùng SQLite để lưu manifest và NTFS USN Change Journal để chỉ đọc
-những thay đổi mới. Vì vậy chế độ chạy liên tục không phải quét toàn bộ cây thư
-mục sau mỗi vài giây.
+Chương trình dùng SQLite để lưu manifest và chỉ đọc NTFS USN Change Journal của
+source. Replica là vùng do chương trình quản lý và không cần quét hoặc đọc USN
+toàn volume đích. Vì vậy HDD replica dung lượng lớn không tạo thêm tải journal.
 
 > [!CAUTION]
 > Đây là công cụ mirror, không phải backup có lịch sử phiên bản. Thay đổi xấu
@@ -19,12 +19,12 @@ mục sau mỗi vài giây.
 
 ## Nguyên tắc hoạt động
 
-1. `init` quét source và replica, tạo manifest SQLite và checkpoint USN.
-2. NTFS tiếp tục ghi các thao tác tạo, sửa, xóa và rename vào USN Journal.
-3. `sync` hoặc `run` chỉ đọc phần journal mới kể từ checkpoint.
-4. Chương trình cập nhật manifest và lập kế hoạch copy/move/quarantine.
-5. Trước thao tác phá hủy, đường dẫn và NTFS file ID được kiểm tra lại.
-6. Theo chu kỳ, chương trình quét đầy đủ để đối soát manifest với filesystem.
+1. `init` chỉ quét source, tạo manifest A và checkpoint USN của source.
+2. Manifest B ban đầu chỉ có root nếu replica trống.
+3. Lần sync đầu copy từng mục và ghi manifest B sau mỗi thao tác thành công.
+4. NTFS ghi thay đổi của source vào USN Journal.
+5. `sync` hoặc `run` đọc phần journal A mới và so với trạng thái B đã áp dụng.
+6. Theo chu kỳ, chương trình chỉ quét lại source để đối soát.
 
 Database chỉ là chỉ mục tăng tốc, không được coi là nguồn sự thật tuyệt đối.
 
@@ -36,9 +36,8 @@ Database chỉ là chỉ mục tăng tốc, không được coi là nguồn sự
 - Database, quarantine và log phải nằm ngoài source và replica.
 - File được copy vào file tạm, `fsync`, sau đó thay thế bằng `os.replace`.
 - File dư tại replica được move sang quarantine thay vì xóa ngay.
-- Replica được xem là vùng do chương trình quản lý. Trong khi `sync` đang chạy,
-  không chỉnh sửa trực tiếp replica; chương trình định kỳ bỏ qua các USN event
-  do chính nó vừa tạo để tránh journal đầy trong lần copy đầu.
+- Replica là vùng chuyên dụng do chương trình quản lý. Không chỉnh sửa trực tiếp
+  hoặc đặt dữ liệu độc lập trong replica; chương trình không đọc USN hay quét B.
 - SHA-256 được tính trong lượt copy hoặc khi cần xác minh nội dung.
 - Rename/move được nhận diện bằng NTFS file ID để tránh copy lại không cần thiết.
 - Nếu USN Journal reset hoặc wrap, chương trình ép đối soát có xác minh hash.
@@ -50,8 +49,9 @@ Các thao tác ghi/xóa chỉ hướng tới replica, quarantine, database và f
 
 - Windows 11.
 - Python 3.10 trở lên; đã kiểm thử với Python 3.12.
-- Source và replica nằm trên volume NTFS có ký tự ổ đĩa.
-- PowerShell hoặc Command Prompt chạy bằng quyền Administrator để đọc USN.
+- Source nằm trên volume NTFS có ký tự ổ đĩa.
+- Replica nên là NTFS; không cần bật hoặc đọc USN trên volume replica.
+- PowerShell hoặc Command Prompt chạy bằng quyền Administrator để đọc USN source.
 - Chỉ sử dụng thư viện chuẩn của Python, không cần cài package ngoài.
 
 ## Cài đặt
@@ -102,11 +102,11 @@ Ví dụ đầy đủ:
 | Biến | Ý nghĩa |
 |---|---|
 | `source` | Thư mục nguồn. Chương trình chính chỉ đọc dữ liệu tại đây. |
-| `replica` | Thư mục đích phải phản chiếu source. File tại đây có thể được tạo, ghi đè, move hoặc chuyển vào quarantine. |
-| `database` | File SQLite chứa manifest, SHA-256, NTFS file ID, checkpoint USN và lịch sử thao tác. Chương trình tự tạo file này. |
+| `replica` | Thư mục đích chuyên dụng. File tại đây có thể được tạo, ghi đè, move hoặc chuyển vào quarantine. Không chỉnh sửa B ngoài chương trình. |
+| `database` | File SQLite chứa manifest A, trạng thái B đã áp dụng, SHA-256, file ID, checkpoint USN A và lịch sử thao tác. |
 | `quarantine` | Nơi giữ file bị loại khỏi replica. Phải cùng volume với replica để `os.replace` hoạt động nguyên tử. |
 | `poll_seconds` | Thời gian nghỉ giữa hai vòng đọc USN trong chế độ `run`; không phải chu kỳ quét toàn bộ. Giá trị nhỏ nhất là 1 giây. |
-| `full_reconcile_hours` | Khoảng thời gian giữa hai lần quét đối soát đầy đủ. `168` giờ tương đương 7 ngày. |
+| `full_reconcile_hours` | Khoảng thời gian giữa hai lần quét lại source. Không quét replica. `168` giờ tương đương 7 ngày. |
 | `trash_retention_days` | Số ngày giữ dữ liệu quarantine trước khi xóa vĩnh viễn. `0` hiện có nghĩa là không tự dọn. |
 | `hash_mode` | `on_copy` tính/xác minh SHA-256; `never` chỉ dựa vào metadata và giảm mức bảo đảm nội dung. Khuyến nghị `on_copy`. |
 | `copy_buffer_mb` | Kích thước mỗi khối đọc/ghi. Đây không phải giới hạn kích thước file. |
@@ -121,22 +121,20 @@ toàn bộ `D:\`, tuyệt đối không đặt database hoặc log trên ổ D.
 
 ## Chuẩn bị USN Change Journal
 
-Mở PowerShell bằng quyền Administrator và kiểm tra journal:
+Mở PowerShell bằng quyền Administrator và kiểm tra journal của source, ví dụ D:
 
 ```powershell
 fsutil usn queryjournal D:
-fsutil usn queryjournal F:
 ```
 
 Nếu Windows báo `The volume change journal is not active`, kích hoạt journal:
 
 ```powershell
 fsutil usn createjournal m=268435456 a=67108864 D:
-fsutil usn createjournal m=268435456 a=67108864 F:
 ```
 
-Ví dụ trên đặt kích thước tối đa 256 MB và allocation delta 64 MB cho mỗi ổ.
-Chế độ `run` yêu cầu journal đọc được trên cả source và replica.
+Ví dụ trên đặt kích thước tối đa 256 MB và allocation delta 64 MB cho source.
+Chế độ `run` không mở USN Journal của replica.
 
 Nếu checkpoint cũ hơn `FirstUsn` hoặc Windows trả về lỗi 1181, chương trình tự
 đánh dấu journal đã wrap và chuyển sang đối soát có xác minh thay vì dừng bằng
@@ -160,8 +158,9 @@ python .\smart_mirror.py init --config .\config.json
 
 - kiểm tra source/replica và quan hệ giữa các đường dẫn;
 - tự tạo database và thư mục replica nếu cần;
-- quét metadata của source và replica;
-- lưu volume serial, root file ID và checkpoint USN;
+- yêu cầu replica trống nếu database chưa có trạng thái B;
+- chỉ quét metadata source;
+- tạo manifest B rỗng và lưu checkpoint USN source;
 - không copy, ghi đè, move hoặc quarantine file trong lần gọi này.
 
 Nên chạy `init` rõ ràng trước lần đồng bộ đầu tiên. Nếu chưa có database, `sync`
@@ -181,7 +180,7 @@ Chạy thật:
 python .\smart_mirror.py sync --config .\config.json
 ```
 
-`sync` đọc phần USN mới, cập nhật manifest, lập kế hoạch và thực hiện tối đa 10
+`sync` đọc phần USN mới của source, cập nhật manifest, lập kế hoạch và thực hiện tối đa 10
 vòng cho đến khi hai phía hội tụ. Các hành động có thể gồm:
 
 - `mkdir`: tạo thư mục tại replica;
@@ -206,8 +205,8 @@ database, checkpoint và thư mục replica.
 python .\smart_mirror.py reconcile --config .\config.json
 ```
 
-Lệnh này quét lại toàn bộ source và replica, làm mới checkpoint và yêu cầu xác
-minh lại hash. Nó chỉ cập nhật database; chưa áp dụng kế hoạch. Sau đó chạy:
+Lệnh này chỉ quét lại toàn bộ source, làm mới checkpoint A và yêu cầu xác minh
+hash nguồn khi cần. Nó không quét replica và chưa áp dụng kế hoạch. Sau đó chạy:
 
 ```powershell
 python .\smart_mirror.py sync --config .\config.json --dry-run
@@ -251,13 +250,15 @@ Ví dụ:
   "last_full_scan": "2026-06-19T10:30:00+00:00",
   "source_entries": 12000,
   "replica_entries": 11990,
+  "replica_tracking_mode": "managed_expected_state",
   "planned_actions": 10,
   "reconcile_required": false
 }
 ```
 
-`status` không đọc journal và không quét filesystem; nó chỉ phản ánh database
-hiện tại. Muốn có kế hoạch cập nhật nhất, dùng `sync --dry-run`.
+`status` không đọc journal và không quét filesystem; `replica_entries` là số mục
+B mà database tin đã áp dụng, không phải kết quả quét ổ B. Muốn có kế hoạch cập
+nhật nhất, dùng `sync --dry-run`.
 
 ## Tùy chọn dòng lệnh
 
@@ -292,7 +293,7 @@ python .\smart_mirror.py run --config .\config.json `
 
 Chương trình tự tạo database SQLite; không cần tạo thủ công. Database lưu:
 
-- manifest source và replica;
+- manifest source và trạng thái replica đã áp dụng thành công;
 - kích thước, `mtime`, SHA-256 và NTFS file ID;
 - volume/root identity;
 - checkpoint USN;
@@ -301,13 +302,15 @@ Chương trình tự tạo database SQLite; không cần tạo thủ công. Data
 Không xóa database khi chương trình đang chạy. Nếu database mất hoặc hỏng:
 
 1. dừng chế độ `run`;
-2. đổi tên/xóa database cũ;
-3. chạy lại `init`;
+2. không xóa database nếu replica hiện tại còn dữ liệu;
+3. nếu database mất hoàn toàn, dùng replica trống mới hoặc di chuyển dữ liệu B
+   cũ ra ngoài trước khi chạy `init`;
 4. chạy `sync --dry-run` và kiểm tra kỹ trước khi đồng bộ thật.
 
 ## Quarantine
 
-Khi một file chỉ còn ở replica, chương trình move nó vào:
+Khi source xóa một file đã được ghi nhận trong manifest B, chương trình move bản
+tương ứng ở replica vào:
 
 ```text
 <quarantine>\YYYY-MM-DD\<đường-dẫn-tương-đối>
@@ -343,8 +346,8 @@ Mở PowerShell bằng **Run as administrator**, kiểm tra lại bằng
 
 ### `The volume change journal is not active`
 
-Kích hoạt journal bằng các lệnh `fsutil usn createjournal` ở phần chuẩn bị USN,
-sau đó chạy lại `reconcile` để lưu checkpoint mới.
+Kích hoạt journal trên source bằng lệnh `fsutil usn createjournal` ở phần chuẩn
+bị USN, sau đó chạy lại `reconcile` để lưu checkpoint mới.
 
 ### `root identity changed` hoặc `volume identity changed`
 
@@ -361,6 +364,9 @@ chu kỳ sau.
 ## Giới hạn
 
 - Chỉ hỗ trợ Windows/NTFS cho chế độ USN liên tục.
+- Không phát hiện thay đổi trực tiếp tại replica vì chương trình không quét B và
+  không đọc USN F. Replica phải là vùng chuyên dụng chỉ do Smart Mirror ghi.
+- `reconcile` chỉ xác minh source; muốn kiểm toán vật lý B cần công cụ/audit riêng.
 - Không copy symbolic link hoặc junction.
 - Hard link chưa được hỗ trợ; đối soát sẽ dừng thay vì tạo manifest sai.
 - Không bảo toàn ACL, owner hoặc alternate data streams.

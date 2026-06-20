@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from smart_mirror import Config, JournalState, MirrorEngine
+from smart_mirror import Config, JournalState, MirrorEngine, UsnRecord
 
 
 class MirrorEngineTests(unittest.TestCase):
@@ -144,6 +144,42 @@ class MirrorEngineTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "Hard links are not supported"):
             self.engine.db.scan("A", self.source, set())
+
+    def test_database_subdirectory_inside_source_is_excluded_from_scan_and_usn(self):
+        internal_db = self.source / "state" / "manifest.sqlite3"
+        cfg = Config(
+            source=self.source,
+            replica=self.replica,
+            database=internal_db,
+            quarantine=self.cfg.quarantine,
+        )
+        cfg.validate()
+        internal_engine = MirrorEngine(cfg)
+        try:
+            count = internal_engine.db.scan(
+                "A",
+                self.source,
+                internal_engine._absolute_excludes(self.source),
+            )
+            self.assertEqual(count, 1)  # source root only
+            self.assertIsNone(internal_engine.db.by_path("A", "state"))
+
+            state_dir = internal_db.parent
+            internal_engine._apply_usn(
+                "A",
+                self.source,
+                UsnRecord(
+                    file_id=state_dir.stat().st_ino,
+                    parent_id=self.source.stat().st_ino,
+                    usn=1,
+                    reason=0,
+                    attributes=0x10,
+                    name=state_dir.name,
+                ),
+            )
+            self.assertIsNone(internal_engine.db.by_path("A", "state"))
+        finally:
+            internal_engine.close()
 
     def test_replaced_replica_root_is_rejected(self):
         self.engine.reconcile()

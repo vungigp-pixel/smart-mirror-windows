@@ -33,7 +33,9 @@ Database chỉ là chỉ mục tăng tốc, không được coi là nguồn sự
 - Code chính không xóa, move hoặc ghi nội dung vào source.
 - Nếu source biến mất hoặc root/volume identity thay đổi, chương trình dừng.
 - Source và replica không được trùng nhau hoặc chứa nhau.
-- Database, quarantine và log phải nằm ngoài source và replica.
+- Quarantine và log phải nằm ngoài source/replica. Database phải nằm ngoài
+  replica; nếu đặt trong source, nó phải ở một thư mục con chuyên dụng và toàn
+  bộ thư mục đó được tự động loại khỏi scan/USN.
 - File được copy vào file tạm, `fsync`, sau đó thay thế bằng `os.replace`.
 - File dư tại replica được move sang quarantine thay vì xóa ngay.
 - Replica là vùng chuyên dụng do chương trình quản lý. Không chỉnh sửa trực tiếp
@@ -103,7 +105,7 @@ Ví dụ đầy đủ:
 |---|---|
 | `source` | Thư mục nguồn. Chương trình chính chỉ đọc dữ liệu tại đây. |
 | `replica` | Thư mục đích chuyên dụng. File tại đây có thể được tạo, ghi đè, move hoặc chuyển vào quarantine. Không chỉnh sửa B ngoài chương trình. |
-| `database` | File SQLite chứa manifest A, trạng thái B đã áp dụng, SHA-256, file ID, checkpoint USN A và lịch sử thao tác. |
+| `database` | File SQLite chứa manifest A, trạng thái B đã áp dụng, SHA-256, file ID, checkpoint USN A và lịch sử thao tác. Nếu nằm trong source, thư mục cha của file được tự động loại trừ hoàn toàn. |
 | `quarantine` | Nơi giữ file bị loại khỏi replica. Phải cùng volume với replica để `os.replace` hoạt động nguyên tử. |
 | `poll_seconds` | Thời gian nghỉ giữa hai vòng đọc USN trong chế độ `run`; không phải chu kỳ quét toàn bộ. Giá trị nhỏ nhất là 1 giây. |
 | `full_reconcile_hours` | Khoảng thời gian giữa hai lần quét lại source. Không quét replica. `168` giờ tương đương 7 ngày. |
@@ -117,7 +119,9 @@ Trong JSON, dấu `\` trong đường dẫn phải được viết thành `\\`, 
 `D:\\DATA`.
 
 Nên đồng bộ một thư mục dữ liệu riêng thay vì toàn bộ root volume. Nếu source là
-toàn bộ `D:\`, tuyệt đối không đặt database hoặc log trên ổ D.
+toàn bộ `D:\`, không đặt log trên ổ D. Database có thể nằm trên D nếu dùng một
+thư mục con chuyên dụng như `D:\SmartMirrorState\manifest.sqlite3`; không đặt
+database trực tiếp tại root source và không lưu dữ liệu khác trong thư mục đó.
 
 ## Chuẩn bị USN Change Journal
 
@@ -306,6 +310,10 @@ Không xóa database khi chương trình đang chạy. Nếu database mất ho�
 3. nếu database mất hoàn toàn, dùng replica trống mới hoặc di chuyển dữ liệu B
    cũ ra ngoài trước khi chạy `init`;
 4. chạy `sync --dry-run` và kiểm tra kỹ trước khi đồng bộ thật.
+
+Khi chuyển database sang ổ khác, dừng `sync/run` trước. Nếu còn file `-wal` hoặc
+`-shm`, dùng SQLite backup API thay vì chỉ copy file `.sqlite3`; không tạo một
+database rỗng mới khi replica hiện tại đã có dữ liệu.
 
 ## Quarantine
 

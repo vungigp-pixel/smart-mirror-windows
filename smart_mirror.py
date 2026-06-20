@@ -155,8 +155,14 @@ class Config:
             raise ValueError("source and replica must be different")
         if is_relative_to(self.replica, self.source) or is_relative_to(self.source, self.replica):
             raise ValueError("source and replica must not contain each other")
-        if is_relative_to(self.database, self.source) or is_relative_to(self.database, self.replica):
-            raise ValueError("database must be outside source and replica")
+        if is_relative_to(self.database, self.replica):
+            raise ValueError("database must be outside replica")
+        if is_relative_to(self.database, self.source) and (
+            self.database.parent.resolve() == self.source.resolve()
+        ):
+            raise ValueError(
+                "database inside source must use a dedicated subdirectory"
+            )
         if is_relative_to(self.quarantine, self.source) or is_relative_to(self.quarantine, self.replica):
             raise ValueError("quarantine must be outside source and replica")
         if self.quarantine.drive.casefold() != self.replica.drive.casefold():
@@ -576,17 +582,37 @@ class MirrorEngine:
         self.cfg = cfg
         self.dry_run = dry_run
         self.db = ManifestDB(cfg.database)
-        self.excludes = {Path(name) for name in cfg.exclude_dirs}
+        self._exclude_cache: dict[str, set[Path]] = {}
 
     def close(self) -> None:
         self.db.close()
 
     def _absolute_excludes(self, root: Path) -> set[Path]:
+        cache_key = str(root.resolve()).casefold()
+        cached = self._exclude_cache.get(cache_key)
+        if cached is not None:
+            return cached
         result = {(root / name).resolve() for name in self.cfg.exclude_dirs}
-        for internal in (self.cfg.database, self.cfg.quarantine):
-            if is_relative_to(internal, root):
-                result.add(internal.resolve())
+        if is_relative_to(self.cfg.database, root):
+            # Exclude SQLite plus its WAL/SHM files and any temporary backup
+            # files by excluding the dedicated state directory as a whole.
+            result.add(self.cfg.database.parent.resolve())
+        if is_relative_to(self.cfg.quarantine, root):
+            result.add(self.cfg.quarantine.resolve())
+        self._exclude_cache[cache_key] = result
         return result
+
+    def _is_excluded_path(self, path: Path, root: Path) -> bool:
+        resolved = path.resolve()
+        for excluded in self._absolute_excludes(root):
+            if resolved == excluded:
+                return True
+            try:
+                resolved.relative_to(excluded)
+                return True
+            except ValueError:
+                pass
+        return False
 
     def reconcile(self) -> None:
         self._validate_roots(initial=True)
@@ -724,6 +750,10 @@ class MirrorEngine:
             return
         absolute = root / rel
         try:
+            if self._is_excluded_path(absolute, root):
+                if existing:
+                    self.db.mark_missing_file_id(side, record.file_id)
+                return
             if absolute.exists() and not is_link_like(absolute):
                 self.db.upsert_path(
                     side,

@@ -37,6 +37,8 @@ Database chỉ là chỉ mục tăng tốc, không được coi là nguồn sự
   replica; nếu đặt trong source, nó phải ở một thư mục con chuyên dụng và toàn
   bộ thư mục đó được tự động loại khỏi scan/USN.
 - File được copy vào file tạm, `fsync`, sau đó thay thế bằng `os.replace`.
+- Trên Windows, thao tác file dùng đường dẫn mở rộng `\\?\` để hỗ trợ tên NTFS
+  trùng thiết bị DOS như `nul`, `con`, `aux`, `prn` và để dọn file tạm ReadOnly.
 - File dư tại replica được move sang quarantine thay vì xóa ngay.
 - Replica là vùng chuyên dụng do chương trình quản lý. Không chỉnh sửa trực tiếp
   hoặc đặt dữ liệu độc lập trong replica; chương trình không đọc USN hay quét B.

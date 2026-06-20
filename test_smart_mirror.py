@@ -1,12 +1,22 @@
 import os
 import shutil
+import stat
 import tempfile
 import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from smart_mirror import Config, JournalState, MirrorEngine, UsnRecord
+from smart_mirror import (
+    Config,
+    JournalState,
+    MirrorEngine,
+    UsnRecord,
+    native_exists,
+    native_path,
+    native_stat,
+    safe_unlink,
+)
 
 
 class MirrorEngineTests(unittest.TestCase):
@@ -180,6 +190,34 @@ class MirrorEngineTests(unittest.TestCase):
             self.assertIsNone(internal_engine.db.by_path("A", "state"))
         finally:
             internal_engine.close()
+
+    @unittest.skipUnless(os.name == "nt", "Windows reserved-name behavior")
+    def test_reserved_nul_filename_is_copied_as_real_ntfs_file(self):
+        source_file = self.source / "nul"
+        replica_file = self.replica / "nul"
+        payload = b"real file named nul"
+        with open(native_path(source_file), "wb") as stream:
+            stream.write(payload)
+        os.chmod(native_path(source_file), stat.S_IREAD)
+        try:
+            self.reconcile_and_sync()
+            with open(native_path(replica_file), "rb") as stream:
+                self.assertEqual(stream.read(), payload)
+            self.assertEqual(native_stat(replica_file).st_size, len(payload))
+            self.assertNotEqual(native_stat(replica_file).st_ino, 0)
+        finally:
+            safe_unlink(source_file)
+            safe_unlink(replica_file)
+
+    @unittest.skipUnless(os.name == "nt", "Windows ReadOnly behavior")
+    def test_safe_unlink_clears_readonly_on_temporary_file(self):
+        temp_file = self.replica / ".nul.smartmirror-test.tmp"
+        temp_file.write_bytes(b"temporary")
+        os.chmod(native_path(temp_file), stat.S_IREAD)
+
+        safe_unlink(temp_file)
+
+        self.assertFalse(native_exists(temp_file))
 
     def test_replaced_replica_root_is_rejected(self):
         self.engine.reconcile()

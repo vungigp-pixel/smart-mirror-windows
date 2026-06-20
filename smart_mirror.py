@@ -15,6 +15,7 @@ import logging
 import os
 import shutil
 import sqlite3
+import stat as stat_module
 import struct
 import sys
 import time
@@ -52,6 +53,47 @@ def utc_now() -> str:
 
 def path_key(path: str) -> str:
     return path.replace("/", "\\").strip("\\").casefold()
+
+
+def native_path(path: str | os.PathLike[str]) -> str:
+    """Use Win32 extended paths so reserved names address real NTFS files."""
+    value = os.fspath(path)
+    if os.name != "nt":
+        return os.path.abspath(value)
+    if value.startswith("\\\\?\\"):
+        return value
+    # ntpath.abspath/GetFullPathName interprets a final component such as NUL
+    # as a DOS device and returns \\.\nul. Build the absolute path lexically.
+    if not os.path.isabs(value):
+        value = os.path.join(os.getcwd(), value)
+    value = os.path.normpath(value)
+    if value.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + value[2:]
+    return "\\\\?\\" + value
+
+
+def native_stat(path: str | os.PathLike[str]) -> os.stat_result:
+    return os.stat(native_path(path), follow_symlinks=False)
+
+
+def native_exists(path: str | os.PathLike[str]) -> bool:
+    try:
+        native_stat(path)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def safe_unlink(path: str | os.PathLike[str]) -> None:
+    """Delete a temporary file, clearing Windows ReadOnly when necessary."""
+    target = native_path(path)
+    try:
+        os.unlink(target)
+    except FileNotFoundError:
+        return
+    except PermissionError:
+        os.chmod(target, stat_module.S_IWRITE)
+        os.unlink(target)
 
 
 def ancestor_path_keys(key: str) -> Iterator[str]:
@@ -241,10 +283,10 @@ class ManifestDB:
         origin_file_id: int | None = None,
         invalidate_hash: bool = False,
     ) -> int:
-        stat = path.stat(follow_symlinks=False)
+        stat = native_stat(path)
         rel = "" if path == root else str(path.relative_to(root))
-        parent_id = None if path == root else path.parent.stat(follow_symlinks=False).st_ino
-        is_dir = path.is_dir() and not path.is_symlink()
+        parent_id = None if path == root else native_stat(path.parent).st_ino
+        is_dir = stat_module.S_ISDIR(stat.st_mode) and not is_link_like(path)
         old = self.conn.execute(
             "SELECT rel_path,is_dir,size,mtime_ns,sha256,origin_file_id FROM nodes WHERE side=? AND file_id=?",
             (side, stat.st_ino),
@@ -364,7 +406,7 @@ class ManifestDB:
         count = 0
         seen_paths: dict[int, Path] = {}
         self.upsert_path(side, root, root, invalidate_hash=invalidate_hashes)
-        seen_paths[root.stat(follow_symlinks=False).st_ino] = root
+        seen_paths[native_stat(root).st_ino] = root
         self.conn.execute("UPDATE nodes SET last_seen=? WHERE side=? AND rel_path=''", (scan_id, side))
         count += 1
 
@@ -387,7 +429,7 @@ class ManifestDB:
                 try:
                     if is_link_like(item) or item.resolve() in excludes:
                         continue
-                    item_stat = item.stat(follow_symlinks=False)
+                    item_stat = native_stat(item)
                 except FileNotFoundError:
                     continue
                 item_id = item_stat.st_ino
@@ -396,7 +438,7 @@ class ManifestDB:
                     previous_still_exists = False
                     try:
                         previous_still_exists = (
-                            previous_path.stat(follow_symlinks=False).st_ino == item_id
+                            native_stat(previous_path).st_ino == item_id
                         )
                     except FileNotFoundError:
                         pass
@@ -754,7 +796,7 @@ class MirrorEngine:
                 if existing:
                     self.db.mark_missing_file_id(side, record.file_id)
                 return
-            if absolute.exists() and not is_link_like(absolute):
+            if native_exists(absolute) and not is_link_like(absolute):
                 self.db.upsert_path(
                     side,
                     root,
@@ -954,7 +996,7 @@ class MirrorEngine:
 
     def _verify_source(self, row: sqlite3.Row) -> Path:
         path = self._source_path(row)
-        stat = path.stat(follow_symlinks=False)
+        stat = native_stat(path)
         if stat.st_ino != row["file_id"]:
             raise RuntimeError(f"Source changed since manifest update: {path}")
         return path
@@ -962,37 +1004,39 @@ class MirrorEngine:
     def _mkdir(self, src: sqlite3.Row) -> None:
         source = self._verify_source(src)
         destination = self.cfg.replica / src["rel_path"]
-        destination.mkdir(parents=True, exist_ok=True)
-        shutil.copystat(source, destination, follow_symlinks=False)
+        os.makedirs(native_path(destination), exist_ok=True)
+        shutil.copystat(native_path(source), native_path(destination), follow_symlinks=False)
         self.db.upsert_path("B", self.cfg.replica, destination, origin_file_id=src["file_id"])
         self.db.conn.commit()
 
     def _copy(self, src: sqlite3.Row) -> None:
         source = self._verify_source(src)
         destination = self.cfg.replica / src["rel_path"]
-        destination.parent.mkdir(parents=True, exist_ok=True)
+        os.makedirs(native_path(destination.parent), exist_ok=True)
         last_error: Exception | None = None
         for attempt in range(self.cfg.max_copy_retries):
             temp = destination.with_name(f".{destination.name}.smartmirror-{uuid.uuid4().hex}.tmp")
             try:
-                before = source.stat(follow_symlinks=False)
+                before = native_stat(source)
                 digest = hashlib.sha256() if self.cfg.hash_mode == "on_copy" else None
-                with source.open("rb") as reader, temp.open("xb") as writer:
+                with open(native_path(source), "rb") as reader, open(
+                    native_path(temp), "xb"
+                ) as writer:
                     while chunk := reader.read(self.cfg.copy_buffer_mb * 1024 * 1024):
                         writer.write(chunk)
                         if digest:
                             digest.update(chunk)
                     writer.flush()
                     os.fsync(writer.fileno())
-                after = source.stat(follow_symlinks=False)
+                after = native_stat(source)
                 if (before.st_ino, before.st_size, before.st_mtime_ns) != (
                     after.st_ino,
                     after.st_size,
                     after.st_mtime_ns,
                 ):
                     raise RuntimeError("Source changed while being copied")
-                shutil.copystat(source, temp, follow_symlinks=False)
-                os.replace(temp, destination)
+                shutil.copystat(native_path(source), native_path(temp), follow_symlinks=False)
+                os.replace(native_path(temp), native_path(destination))
                 source_id = self.db.upsert_path("A", self.cfg.source, source)
                 destination_id = self.db.upsert_path(
                     "B", self.cfg.replica, destination, origin_file_id=source_id
@@ -1007,19 +1051,22 @@ class MirrorEngine:
                 return
             except Exception as exc:
                 last_error = exc
-                temp.unlink(missing_ok=True)
+                try:
+                    safe_unlink(temp)
+                except OSError as cleanup_exc:
+                    logging.warning("Could not remove temporary file %s: %s", temp, cleanup_exc)
                 if attempt + 1 < self.cfg.max_copy_retries:
                     time.sleep(min(2 ** attempt, 5))
         raise RuntimeError(f"Copy failed after retries: {last_error}") from last_error
 
     @staticmethod
     def _stable_hash(path: Path, buffer_size: int) -> str:
-        before = path.stat(follow_symlinks=False)
+        before = native_stat(path)
         digest = hashlib.sha256()
-        with path.open("rb") as stream:
+        with open(native_path(path), "rb") as stream:
             while chunk := stream.read(buffer_size):
                 digest.update(chunk)
-        after = path.stat(follow_symlinks=False)
+        after = native_stat(path)
         if (before.st_ino, before.st_size, before.st_mtime_ns) != (
             after.st_ino,
             after.st_size,
@@ -1031,7 +1078,7 @@ class MirrorEngine:
     def _verify_pair(self, src: sqlite3.Row, dst: sqlite3.Row) -> None:
         source = self._verify_source(src)
         destination = self._replica_path(dst)
-        current = destination.stat(follow_symlinks=False)
+        current = native_stat(destination)
         if current.st_ino != dst["file_id"]:
             raise RuntimeError(f"Destination changed before verification: {destination}")
         buffer_size = self.cfg.copy_buffer_mb * 1024 * 1024
@@ -1050,30 +1097,30 @@ class MirrorEngine:
         self._verify_source(src)
         old = self._replica_path(dst)
         new = self.cfg.replica / src["rel_path"]
-        if not old.exists():
+        if not native_exists(old):
             raise RuntimeError(f"Replica move source is missing: {old}")
-        if new.exists():
+        if native_exists(new):
             raise RuntimeError(f"Replica move destination already exists: {new}")
-        new.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(old, new)
+        os.makedirs(native_path(new.parent), exist_ok=True)
+        os.replace(native_path(old), native_path(new))
         self.db.upsert_path("B", self.cfg.replica, new, origin_file_id=src["file_id"])
         self.db.conn.commit()
 
     def _trash(self, dst: sqlite3.Row) -> None:
         path = self._replica_path(dst)
-        if not path.exists():
+        if not native_exists(path):
             self.db.mark_missing_file_id("B", dst["file_id"])
             self.db.conn.commit()
             return
-        current = path.stat(follow_symlinks=False)
+        current = native_stat(path)
         if current.st_ino != dst["file_id"]:
             raise RuntimeError(f"Refusing to delete changed destination: {path}")
         bucket = datetime.now().strftime("%Y-%m-%d")
         target = self.cfg.quarantine / bucket / dst["rel_path"]
-        if target.exists():
+        if native_exists(target):
             target = target.with_name(target.name + "." + uuid.uuid4().hex)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(path, target)
+        os.makedirs(native_path(target.parent), exist_ok=True)
+        os.replace(native_path(path), native_path(target))
         self.db.mark_missing_path("B", dst["rel_path"], bool(dst["is_dir"]))
         self.db.conn.commit()
 
@@ -1084,9 +1131,9 @@ class MirrorEngine:
         for child in self.cfg.quarantine.iterdir():
             if child.stat().st_mtime < cutoff:
                 if child.is_dir():
-                    shutil.rmtree(child)
+                    shutil.rmtree(native_path(child))
                 else:
-                    child.unlink()
+                    safe_unlink(child)
 
     def run_forever(self) -> None:
         self._ensure_initialized()

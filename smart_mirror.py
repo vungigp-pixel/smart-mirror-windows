@@ -467,6 +467,53 @@ class ManifestDB:
         self.conn.commit()
         return count
 
+    def scan_subtree(
+        self, side: str, root: Path, subtree: Path, excludes: set[Path]
+    ) -> int:
+        """Upsert one newly discovered directory tree without reconciling A."""
+        if subtree.resolve() in excludes:
+            return 0
+        count = 0
+        try:
+            subtree_stat = native_stat(subtree)
+            if subtree_stat.st_nlink > 1:
+                raise RuntimeError(f"Hard links are not supported safely: {subtree}")
+            self.upsert_path(side, root, subtree)
+            count += 1
+        except FileNotFoundError:
+            return 0
+
+        def onerror(exc: OSError) -> None:
+            if not isinstance(exc, FileNotFoundError):
+                raise exc
+
+        for current, dirs, files in os.walk(
+            subtree, topdown=True, onerror=onerror, followlinks=False
+        ):
+            current_path = Path(current)
+            retained_dirs = []
+            for name in dirs:
+                directory = current_path / name
+                try:
+                    if not is_link_like(directory) and directory.resolve() not in excludes:
+                        retained_dirs.append(name)
+                except FileNotFoundError:
+                    continue
+            dirs[:] = retained_dirs
+            for name in dirs + files:
+                item = current_path / name
+                try:
+                    if is_link_like(item) or item.resolve() in excludes:
+                        continue
+                    item_stat = native_stat(item)
+                    if item_stat.st_nlink > 1:
+                        raise RuntimeError(f"Hard links are not supported safely: {item}")
+                    self.upsert_path(side, root, item)
+                    count += 1
+                except FileNotFoundError:
+                    continue
+        return count
+
     def bind_origins_by_path(self) -> None:
         self.conn.execute(
             """
@@ -804,12 +851,25 @@ class MirrorEngine:
                     invalidate_hash=bool(record.reason & USN_REASON_HASH_INVALIDATING),
                 )
                 if (record.attributes & FILE_ATTRIBUTE_DIRECTORY) and existing is None:
-                    # A populated directory may have been moved into the root;
-                    # NTFS does not emit one rename record for every child.
-                    self.db.set_meta("reconcile_required", "1")
+                    # A populated directory may have moved into the configured
+                    # root without one USN record per child. Scan only this tree.
+                    count = self.db.scan_subtree(
+                        side,
+                        root,
+                        absolute,
+                        self._absolute_excludes(root),
+                    )
+                    logging.info(
+                        "Scanned newly discovered source subtree: %s (%d entries)",
+                        absolute,
+                        count,
+                    )
             else:
                 self.db.mark_missing_file_id(side, record.file_id)
-        except OSError:
+        except FileNotFoundError:
+            self.db.mark_missing_file_id(side, record.file_id)
+        except OSError as exc:
+            logging.warning("USN path update failed for %s: %s", absolute, exc)
             self.db.set_meta("reconcile_required", "1")
 
     def _ensure_initialized(self) -> None:
@@ -927,7 +987,7 @@ class MirrorEngine:
             if self.db.get_meta("reconcile_required") == "1":
                 self.reconcile()
                 self.db.set_meta("reconcile_required", "0")
-        totals = {"planned": 0, "completed": 0, "failed": 0}
+        totals = {"planned": 0, "completed": 0, "skipped": 0, "failed": 0}
         for round_number in range(1, 11):
             planning_started = time.monotonic()
             logging.info("Planning synchronization actions (round %d)...", round_number)
@@ -967,6 +1027,17 @@ class MirrorEngine:
                         self._trash(dst)
                     totals["completed"] += 1
                     self.db.record(action, rel, "completed")
+                except FileNotFoundError as exc:
+                    if src is None:
+                        totals["failed"] += 1
+                        self.db.record(action, rel, "failed", repr(exc))
+                        logging.exception("Failed %s: %s", action, rel)
+                    else:
+                        self.db.mark_missing_file_id("A", src["file_id"])
+                        self.db.conn.commit()
+                        totals["skipped"] += 1
+                        self.db.record(action, rel, "skipped", repr(exc))
+                        logging.info("Skipped vanished source: %s", rel)
                 except Exception as exc:
                     totals["failed"] += 1
                     self.db.record(action, rel, "failed", repr(exc))
@@ -974,10 +1045,12 @@ class MirrorEngine:
                 now = time.monotonic()
                 if action_index == len(actions) or now - last_progress >= 10:
                     logging.info(
-                        "Execution progress: %d/%d actions (completed=%d failed=%d)",
+                        "Execution progress: %d/%d actions "
+                        "(completed=%d skipped=%d failed=%d)",
                         action_index,
                         len(actions),
                         totals["completed"],
+                        totals["skipped"],
                         totals["failed"],
                     )
                     last_progress = now
@@ -1049,6 +1122,12 @@ class MirrorEngine:
                     )
                 self.db.conn.commit()
                 return
+            except FileNotFoundError:
+                try:
+                    safe_unlink(temp)
+                except OSError as cleanup_exc:
+                    logging.warning("Could not remove temporary file %s: %s", temp, cleanup_exc)
+                raise
             except Exception as exc:
                 last_error = exc
                 try:

@@ -26,6 +26,9 @@ toàn volume đích. Vì vậy HDD replica dung lượng lớn không tạo thê
 5. `sync` hoặc `run` đọc phần journal A mới và so với trạng thái B đã áp dụng.
 6. Theo chu kỳ, chương trình chỉ quét lại source để đối soát.
 
+Khi USN báo một thư mục mới, chương trình chỉ scan subtree đó. File tạm biến mất
+giữa lúc lập kế hoạch và copy được ghi là `skipped`, không ép quét lại toàn A.
+
 Database chỉ là chỉ mục tăng tốc, không được coi là nguồn sự thật tuyệt đối.
 
 ## Bảo vệ dữ liệu
@@ -199,8 +202,11 @@ vòng cho đến khi hai phía hội tụ. Các hành động có thể gồm:
 Kết quả ví dụ:
 
 ```json
-{"planned": 5, "completed": 5, "failed": 0}
+{"planned": 5, "completed": 4, "skipped": 1, "failed": 0}
 ```
+
+`skipped` thường là file `.tmp` đã được ứng dụng nguồn đổi tên hoặc xóa trước
+khi tới lượt copy. Đây không phải lỗi đồng bộ; manifest A được cập nhật lại.
 
 `--dry-run` không thay đổi replica/quarantine, nhưng vẫn có thể tạo hoặc cập nhật
 database, checkpoint và thư mục replica.

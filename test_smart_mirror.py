@@ -219,6 +219,43 @@ class MirrorEngineTests(unittest.TestCase):
 
         self.assertFalse(native_exists(temp_file))
 
+    def test_new_directory_usn_scans_only_its_subtree(self):
+        self.engine.reconcile()
+        new_dir = self.source / "new-tree"
+        new_dir.mkdir()
+        child = new_dir / "child.bin"
+        child.write_bytes(b"child")
+
+        self.engine._apply_usn(
+            "A",
+            self.source,
+            UsnRecord(
+                file_id=native_stat(new_dir).st_ino,
+                parent_id=native_stat(self.source).st_ino,
+                usn=1,
+                reason=0,
+                attributes=0x10,
+                name=new_dir.name,
+            ),
+        )
+
+        self.assertIsNotNone(self.engine.db.by_path("A", "new-tree"))
+        self.assertIsNotNone(self.engine.db.by_path("A", "new-tree\\child.bin"))
+        self.assertNotEqual(self.engine.db.get_meta("reconcile_required"), "1")
+
+    def test_source_file_vanishing_after_plan_is_skipped(self):
+        transient = self.source / "transient.tmp"
+        transient.write_bytes(b"temporary")
+        self.engine.reconcile()
+        transient.unlink()
+        self.engine.ingest_journals = lambda: False
+
+        result = self.engine.sync()
+
+        self.assertEqual(result["skipped"], 1)
+        self.assertEqual(result["failed"], 0)
+        self.assertIsNone(self.engine.db.by_path("A", transient.name))
+
     def test_replaced_replica_root_is_rejected(self):
         self.engine.reconcile()
         shutil.rmtree(self.replica)

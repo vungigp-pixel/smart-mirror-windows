@@ -356,9 +356,9 @@ class ManifestDB:
     ) -> int:
         scan_id = uuid.uuid4().hex
         count = 0
-        seen_ids: set[int] = set()
+        seen_paths: dict[int, Path] = {}
         self.upsert_path(side, root, root, invalidate_hash=invalidate_hashes)
-        seen_ids.add(root.stat(follow_symlinks=False).st_ino)
+        seen_paths[root.stat(follow_symlinks=False).st_ino] = root
         self.conn.execute("UPDATE nodes SET last_seen=? WHERE side=? AND rel_path=''", (scan_id, side))
         count += 1
 
@@ -367,26 +367,51 @@ class ManifestDB:
 
         for current, dirs, files in os.walk(root, topdown=True, onerror=onerror, followlinks=False):
             current_path = Path(current)
-            dirs[:] = [
-                name
-                for name in dirs
-                if not is_link_like(current_path / name)
-                and (current_path / name).resolve() not in excludes
-            ]
+            retained_dirs = []
+            for name in dirs:
+                directory = current_path / name
+                try:
+                    if not is_link_like(directory) and directory.resolve() not in excludes:
+                        retained_dirs.append(name)
+                except FileNotFoundError:
+                    continue
+            dirs[:] = retained_dirs
             for name in dirs + files:
                 item = current_path / name
-                if is_link_like(item) or item.resolve() in excludes:
+                try:
+                    if is_link_like(item) or item.resolve() in excludes:
+                        continue
+                    item_stat = item.stat(follow_symlinks=False)
+                except FileNotFoundError:
                     continue
-                item_id = item.stat(follow_symlinks=False).st_ino
-                if item_id in seen_ids:
-                    raise RuntimeError(f"Hard links are not supported safely: {item}")
-                seen_ids.add(item_id)
-                self.upsert_path(side, root, item, invalidate_hash=invalidate_hashes)
+                item_id = item_stat.st_ino
+                previous_path = seen_paths.get(item_id)
+                if previous_path is not None:
+                    previous_still_exists = False
+                    try:
+                        previous_still_exists = (
+                            previous_path.stat(follow_symlinks=False).st_ino == item_id
+                        )
+                    except FileNotFoundError:
+                        pass
+                    if item_stat.st_nlink > 1 or previous_still_exists:
+                        raise RuntimeError(f"Hard links are not supported safely: {item}")
+                    logging.debug(
+                        "Detected rename/move during scan: %s -> %s",
+                        previous_path,
+                        item,
+                    )
+                else:
+                    count += 1
+                seen_paths[item_id] = item
+                try:
+                    self.upsert_path(side, root, item, invalidate_hash=invalidate_hashes)
+                except FileNotFoundError:
+                    continue
                 self.conn.execute(
                     "UPDATE nodes SET last_seen=? WHERE side=? AND file_id=?",
-                    (scan_id, side, item.stat(follow_symlinks=False).st_ino),
+                    (scan_id, side, item_id),
                 )
-                count += 1
         self.conn.execute(
             "UPDATE nodes SET present=0 WHERE side=? AND present=1 AND last_seen<>?",
             (side, scan_id),

@@ -1,3 +1,4 @@
+import os
 import shutil
 import tempfile
 import time
@@ -117,6 +118,32 @@ class MirrorEngineTests(unittest.TestCase):
         )
         self.assertIsNone(self.engine.db.get_meta("B_journal_id"))
         self.assertIsNone(self.engine.db.get_meta("B_next_usn"))
+
+    def test_source_rename_during_scan_is_not_misclassified_as_hard_link(self):
+        old_path = self.source / "old.bin"
+        new_path = self.source / "new.bin"
+        old_path.write_bytes(b"moving")
+
+        def moving_walk():
+            yield str(self.source), [], [old_path.name]
+            old_path.rename(new_path)
+            yield str(self.source), [], [new_path.name]
+
+        with patch("smart_mirror.os.walk", return_value=moving_walk()):
+            count = self.engine.db.scan("A", self.source, set())
+
+        self.assertEqual(count, 2)  # root plus one physical file
+        self.assertIsNone(self.engine.db.by_path("A", old_path.name))
+        self.assertIsNotNone(self.engine.db.by_path("A", new_path.name))
+
+    def test_real_hard_link_is_still_rejected(self):
+        original = self.source / "original.bin"
+        linked = self.source / "linked.bin"
+        original.write_bytes(b"hard-linked")
+        os.link(original, linked)
+
+        with self.assertRaisesRegex(RuntimeError, "Hard links are not supported"):
+            self.engine.db.scan("A", self.source, set())
 
     def test_replaced_replica_root_is_rejected(self):
         self.engine.reconcile()

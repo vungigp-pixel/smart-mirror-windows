@@ -2,6 +2,7 @@
   "source": "D:\\DATA",
   "replica": "F:\\DATA1",
   "database": "F:\\SmartMirrorState\\manifest.sqlite3",
+  "quarantine_flag": true,
   "quarantine": "F:\\SmartMirrorTrash",
   "poll_seconds": 30,
   "full_reconcile_hours": 168,

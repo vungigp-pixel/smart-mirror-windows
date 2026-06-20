@@ -256,6 +256,42 @@ class MirrorEngineTests(unittest.TestCase):
         self.assertEqual(result["failed"], 0)
         self.assertIsNone(self.engine.db.by_path("A", transient.name))
 
+    def test_quarantine_disabled_permanently_deletes_readonly_tree(self):
+        delete_engine = MirrorEngine(
+            Config(
+                source=self.source,
+                replica=self.replica,
+                database=self.cfg.database.with_name("delete-mode.sqlite3"),
+                quarantine=self.cfg.quarantine,
+                quarantine_flag=False,
+            )
+        )
+        source_dir = self.source / "remove-me"
+        replica_dir = self.replica / "remove-me"
+        source_dir.mkdir()
+        (source_dir / "readonly.bin").write_bytes(b"delete permanently")
+        try:
+            delete_engine.reconcile()
+            first = delete_engine.sync()
+            self.assertEqual(first["failed"], 0)
+            os.chmod(native_path(replica_dir / "readonly.bin"), stat.S_IREAD)
+            shutil.rmtree(source_dir)
+            delete_engine.reconcile()
+
+            actions = delete_engine.plan()
+            self.assertEqual([action for action, _, _ in actions], ["delete"])
+            second = delete_engine.sync()
+
+            self.assertEqual(second["failed"], 0)
+            self.assertFalse(native_exists(replica_dir))
+            self.assertFalse(self.cfg.quarantine.exists())
+            operation = delete_engine.db.conn.execute(
+                "SELECT action,status FROM operations ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            self.assertEqual(tuple(operation), ("delete", "completed"))
+        finally:
+            delete_engine.close()
+
     def test_replaced_replica_root_is_rejected(self):
         self.engine.reconcile()
         shutil.rmtree(self.replica)

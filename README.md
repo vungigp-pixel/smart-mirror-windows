@@ -5,7 +5,7 @@ Smart Mirror là chương trình Python đồng bộ một chiều trên Windows
 ```text
 source (chỉ đọc) ──────────────> replica (được cập nhật)
                                   │
-                                  └── file dư/xóa → quarantine
+                                  └── file dư/xóa → quarantine hoặc xóa vĩnh viễn
 ```
 
 Chương trình dùng SQLite để lưu manifest và chỉ đọc NTFS USN Change Journal của
@@ -42,7 +42,8 @@ Database chỉ là chỉ mục tăng tốc, không được coi là nguồn sự
 - File được copy vào file tạm, `fsync`, sau đó thay thế bằng `os.replace`.
 - Trên Windows, thao tác file dùng đường dẫn mở rộng `\\?\` để hỗ trợ tên NTFS
   trùng thiết bị DOS như `nul`, `con`, `aux`, `prn` và để dọn file tạm ReadOnly.
-- File dư tại replica được move sang quarantine thay vì xóa ngay.
+- Mặc định file dư tại replica được move sang quarantine. Có thể chọn xóa vĩnh
+  viễn bằng `quarantine_flag=false`.
 - Replica là vùng chuyên dụng do chương trình quản lý. Không chỉnh sửa trực tiếp
   hoặc đặt dữ liệu độc lập trong replica; chương trình không đọc USN hay quét B.
 - SHA-256 được tính trong lượt copy hoặc khi cần xác minh nội dung.
@@ -90,6 +91,7 @@ Ví dụ đầy đủ:
   "source": "D:\\DATA",
   "replica": "F:\\DATA1",
   "database": "F:\\SmartMirrorState\\manifest.sqlite3",
+  "quarantine_flag": true,
   "quarantine": "F:\\SmartMirrorTrash",
   "poll_seconds": 30,
   "full_reconcile_hours": 168,
@@ -111,6 +113,7 @@ Ví dụ đầy đủ:
 | `source` | Thư mục nguồn. Chương trình chính chỉ đọc dữ liệu tại đây. |
 | `replica` | Thư mục đích chuyên dụng. File tại đây có thể được tạo, ghi đè, move hoặc chuyển vào quarantine. Không chỉnh sửa B ngoài chương trình. |
 | `database` | File SQLite chứa manifest A, trạng thái B đã áp dụng, SHA-256, file ID, checkpoint USN A và lịch sử thao tác. Nếu nằm trong source, thư mục cha của file được tự động loại trừ hoàn toàn. |
+| `quarantine_flag` | `true`: move dữ liệu bị loại khỏi B vào quarantine. `false`: xóa vĩnh viễn ngay lập tức. Phải là boolean JSON, không đặt trong dấu nháy. |
 | `quarantine` | Nơi giữ file bị loại khỏi replica. Phải cùng volume với replica để `os.replace` hoạt động nguyên tử. |
 | `poll_seconds` | Thời gian nghỉ giữa hai vòng đọc USN trong chế độ `run`; không phải chu kỳ quét toàn bộ. Giá trị nhỏ nhất là 1 giây. |
 | `full_reconcile_hours` | Khoảng thời gian giữa hai lần quét lại source. Không quét replica. `168` giờ tương đương 7 ngày. |
@@ -198,6 +201,7 @@ vòng cho đến khi hai phía hội tụ. Các hành động có thể gồm:
 - `move`: đổi tên hoặc di chuyển bên trong replica;
 - `replace_type`: xử lý xung đột file/thư mục;
 - `trash`: chuyển dữ liệu dư tại replica vào quarantine.
+- `delete`: xóa vĩnh viễn dữ liệu dư khi `quarantine_flag=false`.
 
 Kết quả ví dụ:
 
@@ -325,6 +329,12 @@ database rỗng mới khi replica hiện tại đã có dữ liệu.
 
 ## Quarantine
 
+Với cấu hình an toàn mặc định:
+
+```json
+"quarantine_flag": true
+```
+
 Khi source xóa một file đã được ghi nhận trong manifest B, chương trình move bản
 tương ứng ở replica vào:
 
@@ -335,6 +345,16 @@ tương ứng ở replica vào:
 Sau `trash_retention_days`, bucket cũ được xóa vĩnh viễn. Có thể phục hồi thủ
 công từ quarantine trước thời hạn. Không đặt dữ liệu cần giữ độc lập trong
 replica vì mirror sẽ coi đó là dữ liệu dư.
+
+Nếu dùng:
+
+```json
+"quarantine_flag": false
+```
+
+file/thư mục sẽ bị xóa trực tiếp khỏi replica, kể cả dữ liệu ReadOnly, và không
+thể phục hồi từ Smart Mirror. Khi đó `quarantine` và `trash_retention_days`
+không được sử dụng. Luôn kiểm tra trước bằng `sync --dry-run`.
 
 ## Kiểm thử
 

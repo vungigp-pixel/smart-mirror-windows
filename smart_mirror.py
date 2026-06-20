@@ -96,6 +96,16 @@ def safe_unlink(path: str | os.PathLike[str]) -> None:
         os.unlink(target)
 
 
+def safe_rmtree(path: str | os.PathLike[str]) -> None:
+    """Recursively delete a tree, clearing ReadOnly attributes when needed."""
+
+    def clear_readonly_and_retry(function, failed_path, _exc_info):
+        os.chmod(failed_path, stat_module.S_IWRITE)
+        function(failed_path)
+
+    shutil.rmtree(native_path(path), onerror=clear_readonly_and_retry)
+
+
 def ancestor_path_keys(key: str) -> Iterator[str]:
     """Yield parent path keys from nearest to farthest in O(path depth)."""
     end = len(key)
@@ -153,6 +163,7 @@ class Config:
     replica: Path
     database: Path
     quarantine: Path
+    quarantine_flag: bool = True
     poll_seconds: int = 30
     full_reconcile_hours: int = 168
     trash_retention_days: int = 30
@@ -167,6 +178,9 @@ class Config:
     @classmethod
     def load(cls, filename: Path) -> "Config":
         raw = json.loads(filename.read_text(encoding="utf-8-sig"))
+        quarantine_flag = raw.get("quarantine_flag", True)
+        if not isinstance(quarantine_flag, bool):
+            raise ValueError("quarantine_flag must be a JSON boolean: true or false")
         source = Path(os.path.abspath(os.path.expandvars(raw["source"])))
         replica = Path(os.path.abspath(os.path.expandvars(raw["replica"])))
         database = Path(os.path.abspath(os.path.expandvars(raw["database"])))
@@ -179,6 +193,7 @@ class Config:
             replica=replica,
             database=database,
             quarantine=quarantine,
+            quarantine_flag=quarantine_flag,
             poll_seconds=max(1, int(raw.get("poll_seconds", 30))),
             full_reconcile_hours=max(1, int(raw.get("full_reconcile_hours", 168))),
             trash_retention_days=max(0, int(raw.get("trash_retention_days", 30))),
@@ -205,10 +220,13 @@ class Config:
             raise ValueError(
                 "database inside source must use a dedicated subdirectory"
             )
-        if is_relative_to(self.quarantine, self.source) or is_relative_to(self.quarantine, self.replica):
-            raise ValueError("quarantine must be outside source and replica")
-        if self.quarantine.drive.casefold() != self.replica.drive.casefold():
-            raise ValueError("quarantine and replica must be on the same volume")
+        if self.quarantine_flag:
+            if is_relative_to(self.quarantine, self.source) or is_relative_to(
+                self.quarantine, self.replica
+            ):
+                raise ValueError("quarantine must be outside source and replica")
+            if self.quarantine.drive.casefold() != self.replica.drive.casefold():
+                raise ValueError("quarantine and replica must be on the same volume")
 
 
 class ManifestDB:
@@ -686,7 +704,7 @@ class MirrorEngine:
             # Exclude SQLite plus its WAL/SHM files and any temporary backup
             # files by excluding the dedicated state directory as a whole.
             result.add(self.cfg.database.parent.resolve())
-        if is_relative_to(self.cfg.quarantine, root):
+        if self.cfg.quarantine_flag and is_relative_to(self.cfg.quarantine, root):
             result.add(self.cfg.quarantine.resolve())
         self._exclude_cache[cache_key] = result
         return result
@@ -972,7 +990,8 @@ class MirrorEngine:
             parts = Path(row["rel_path"]).parts
             ancestor_keys = {path_key(str(Path(*parts[:i]))) for i in range(1, len(parts))}
             if not ancestor_keys.intersection(extra_keys):
-                actions.append(("trash", None, row))
+                action = "trash" if self.cfg.quarantine_flag else "delete"
+                actions.append((action, None, row))
         return actions
 
     def sync(self) -> dict[str, int]:
@@ -1023,7 +1042,7 @@ class MirrorEngine:
                     elif action == "replace_type":
                         self._trash(dst)
                         self._mkdir(src) if src["is_dir"] else self._copy(src)
-                    elif action == "trash":
+                    elif action in {"trash", "delete"}:
                         self._trash(dst)
                     totals["completed"] += 1
                     self.db.record(action, rel, "completed")
@@ -1194,23 +1213,33 @@ class MirrorEngine:
         current = native_stat(path)
         if current.st_ino != dst["file_id"]:
             raise RuntimeError(f"Refusing to delete changed destination: {path}")
-        bucket = datetime.now().strftime("%Y-%m-%d")
-        target = self.cfg.quarantine / bucket / dst["rel_path"]
-        if native_exists(target):
-            target = target.with_name(target.name + "." + uuid.uuid4().hex)
-        os.makedirs(native_path(target.parent), exist_ok=True)
-        os.replace(native_path(path), native_path(target))
+        if self.cfg.quarantine_flag:
+            bucket = datetime.now().strftime("%Y-%m-%d")
+            target = self.cfg.quarantine / bucket / dst["rel_path"]
+            if native_exists(target):
+                target = target.with_name(target.name + "." + uuid.uuid4().hex)
+            os.makedirs(native_path(target.parent), exist_ok=True)
+            os.replace(native_path(path), native_path(target))
+        elif dst["is_dir"]:
+            safe_rmtree(path)
+        else:
+            safe_unlink(path)
         self.db.mark_missing_path("B", dst["rel_path"], bool(dst["is_dir"]))
         self.db.conn.commit()
 
     def purge_old_trash(self) -> None:
-        if self.dry_run or self.cfg.trash_retention_days <= 0 or not self.cfg.quarantine.exists():
+        if (
+            not self.cfg.quarantine_flag
+            or self.dry_run
+            or self.cfg.trash_retention_days <= 0
+            or not self.cfg.quarantine.exists()
+        ):
             return
         cutoff = time.time() - self.cfg.trash_retention_days * 86400
         for child in self.cfg.quarantine.iterdir():
             if child.stat().st_mtime < cutoff:
                 if child.is_dir():
-                    shutil.rmtree(native_path(child))
+                    safe_rmtree(child)
                 else:
                     safe_unlink(child)
 

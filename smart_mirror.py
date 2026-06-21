@@ -45,6 +45,7 @@ USN_REASON_HASH_INVALIDATING = (
 FSCTL_QUERY_USN_JOURNAL = 0x000900F4
 FSCTL_READ_USN_JOURNAL = 0x000900BB
 ERROR_JOURNAL_ENTRY_DELETED = 1181
+SCRIPT_DIR = Path(__file__).resolve().parent
 
 
 def utc_now() -> str:
@@ -104,6 +105,11 @@ def safe_rmtree(path: str | os.PathLike[str]) -> None:
         function(failed_path)
 
     shutil.rmtree(native_path(path), onerror=clear_readonly_and_retry)
+
+
+def resolve_config_path(path: Path) -> Path:
+    """Resolve relative config paths beside the executable script."""
+    return path.resolve() if path.is_absolute() else (SCRIPT_DIR / path).resolve()
 
 
 def ancestor_path_keys(key: str) -> Iterator[str]:
@@ -178,6 +184,13 @@ class Config:
     @classmethod
     def load(cls, filename: Path) -> "Config":
         raw = json.loads(filename.read_text(encoding="utf-8-sig"))
+        required = {"source", "replica", "database"}
+        missing = sorted(required.difference(raw))
+        if missing:
+            raise ValueError(
+                f"Config file '{filename}' is missing required keys: "
+                + ", ".join(missing)
+            )
         quarantine_flag = raw.get("quarantine_flag", True)
         if not isinstance(quarantine_flag, bool):
             raise ValueError("quarantine_flag must be a JSON boolean: true or false")
@@ -232,8 +245,9 @@ class Config:
 class ManifestDB:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(path)
+        self.conn = sqlite3.connect(path, timeout=5)
         self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA busy_timeout=5000")
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=FULL")
         self.conn.executescript(
@@ -1281,6 +1295,52 @@ def configure_logging(log_file: Path | None, verbose: bool) -> None:
     )
 
 
+class InstanceLock:
+    """Hold a process-level lock for one manifest database."""
+
+    def __init__(self, database: Path):
+        self.path = database.with_name(database.name + ".lock")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.file = self.path.open("a+b")
+        try:
+            self.file.seek(0, os.SEEK_END)
+            if self.file.tell() == 0:
+                self.file.write(b"\0")
+                self.file.flush()
+            self.file.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(self.file.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self.file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, ImportError) as exc:
+            self.file.close()
+            raise RuntimeError(
+                "Another Smart Mirror process is using this database. "
+                "Stop the existing 'run' or 'sync' process before starting another one: "
+                f"{database}"
+            ) from exc
+
+    def close(self) -> None:
+        if self.file.closed:
+            return
+        try:
+            self.file.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(self.file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self.file.fileno(), fcntl.LOCK_UN)
+        finally:
+            self.file.close()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Safe incremental one-way folder mirror")
     parser.add_argument("command", choices=("init", "sync", "run", "reconcile", "status"))
@@ -1289,18 +1349,39 @@ def main() -> int:
     parser.add_argument("--log", type=Path)
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
-    cfg = Config.load(args.config)
+    config_path = resolve_config_path(args.config)
+    try:
+        cfg = Config.load(config_path)
+    except (OSError, ValueError) as exc:
+        parser.error(f"Could not load config '{config_path}': {exc}")
     log_file = Path(os.path.abspath(args.log)) if args.log else None
     if log_file and (
         is_relative_to(log_file, cfg.source) or is_relative_to(log_file, cfg.replica)
     ):
         raise SystemExit("Log file must be outside source and replica to avoid a sync loop")
     configure_logging(log_file, args.verbose)
+    logging.info("Config file: %s", config_path)
+    logging.info("Manifest database: %s", cfg.database)
     if not cfg.source.is_dir():
         raise SystemExit(f"Source directory does not exist; refusing to create it: {cfg.source}")
     cfg.replica.mkdir(parents=True, exist_ok=True)
-    engine = MirrorEngine(cfg, dry_run=args.dry_run)
     try:
+        instance_lock = InstanceLock(cfg.database)
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
+    engine = None
+    try:
+        logging.info("Opening manifest database...")
+        try:
+            engine = MirrorEngine(cfg, dry_run=args.dry_run)
+        except sqlite3.OperationalError as exc:
+            if "locked" in str(exc).casefold():
+                raise SystemExit(
+                    "Manifest database is locked by another process. "
+                    "Stop the existing Smart Mirror 'run' or 'sync' process, then retry."
+                ) from exc
+            raise
+        logging.info("Manifest database opened")
         if args.command in {"init", "reconcile"}:
             if args.command == "reconcile":
                 engine.db.set_meta("verify_all_required", "1")
@@ -1329,7 +1410,9 @@ def main() -> int:
             )
         return 0
     finally:
-        engine.close()
+        if engine is not None:
+            engine.close()
+        instance_lock.close()
 
 
 if __name__ == "__main__":

@@ -160,6 +160,10 @@ Cú pháp chung:
 python .\smart_mirror.py <init|sync|reconcile|run|status> --config .\config.json
 ```
 
+Đường dẫn `--config` tương đối được tính theo thư mục chứa `smart_mirror.py`,
+không theo working directory hiện tại. Vì vậy có thể gọi script bằng đường dẫn
+tuyệt đối từ thư mục khác mà vẫn dùng `--config .\config.json`.
+
 ### `init` — tạo baseline lần đầu
 
 ```powershell
@@ -396,6 +400,13 @@ lý trước, sau đó mới quyết định tạo baseline mới.
 Kiểm tra file log, quyền truy cập, dung lượng trống và file đang bị ứng dụng
 khóa. Chương trình không coi thao tác thất bại là thành công và sẽ thử lại ở
 chu kỳ sau.
+
+### Lệnh chạy nhưng không hiển thị gì
+
+Không chạy `sync` trong khi một tiến trình `run` đang sử dụng cùng database. Chế độ
+`run` đã tự động đồng bộ theo `poll_seconds`; hãy nhấn `Ctrl+C` để dừng nó trước khi
+chạy `sync` thủ công. Chương trình báo đường dẫn config/database ngay khi khởi động
+và từ chối tiến trình thứ hai thay vì chờ SQLite im lặng.
 
 ## Giới hạn
 

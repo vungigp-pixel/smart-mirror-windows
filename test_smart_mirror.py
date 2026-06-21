@@ -9,14 +9,31 @@ from unittest.mock import patch
 
 from smart_mirror import (
     Config,
+    InstanceLock,
     JournalState,
     MirrorEngine,
     UsnRecord,
     native_exists,
     native_path,
     native_stat,
+    resolve_config_path,
     safe_unlink,
 )
+
+
+class InstanceLockTests(unittest.TestCase):
+    def test_prevents_two_processes_using_same_database(self):
+        with tempfile.TemporaryDirectory() as temp:
+            database = Path(temp) / "manifest.sqlite3"
+            first = InstanceLock(database)
+            try:
+                with self.assertRaisesRegex(RuntimeError, "Another Smart Mirror process"):
+                    InstanceLock(database)
+            finally:
+                first.close()
+
+            second = InstanceLock(database)
+            second.close()
 
 
 class MirrorEngineTests(unittest.TestCase):
@@ -291,6 +308,21 @@ class MirrorEngineTests(unittest.TestCase):
             self.assertEqual(tuple(operation), ("delete", "completed"))
         finally:
             delete_engine.close()
+
+    def test_relative_config_path_resolves_beside_script(self):
+        with patch("smart_mirror.SCRIPT_DIR", self.source):
+            resolved = resolve_config_path(Path("config.json"))
+
+        self.assertEqual(resolved, (self.source / "config.json").resolve())
+
+    def test_config_missing_required_keys_has_clear_error(self):
+        wrong_config = self.source / "wrong-config.json"
+        wrong_config.write_text('{"general": {}}', encoding="utf-8")
+
+        with self.assertRaisesRegex(
+            ValueError, "missing required keys: database, replica, source"
+        ):
+            Config.load(wrong_config)
 
     def test_replaced_replica_root_is_rejected(self):
         self.engine.reconcile()

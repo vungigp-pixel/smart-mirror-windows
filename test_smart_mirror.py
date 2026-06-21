@@ -64,6 +64,19 @@ class MirrorEngineTests(unittest.TestCase):
         self.assertEqual(result["failed"], 0)
         return result
 
+    def test_repeated_delete_usn_for_missing_directory_is_noop(self):
+        directory = self.source / "old"
+        directory.mkdir()
+        file_id = directory.stat().st_ino
+        self.engine.reconcile()
+        directory.rmdir()
+
+        self.engine.db.mark_missing_file_id("A", file_id)
+        changes_after_first_delete = self.engine.db.conn.total_changes
+        self.engine.db.mark_missing_file_id("A", file_id)
+
+        self.assertEqual(self.engine.db.conn.total_changes, changes_after_first_delete)
+
     def test_create_modify_and_delete(self):
         item = self.source / "folder" / "data.txt"
         item.parent.mkdir()

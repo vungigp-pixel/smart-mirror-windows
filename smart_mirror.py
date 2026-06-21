@@ -386,7 +386,7 @@ class ManifestDB:
 
     def mark_missing_file_id(self, side: str, file_id: int) -> None:
         row = self.by_file_id(side, file_id)
-        if not row:
+        if not row or not row["present"]:
             return
         replacement = self.by_path(side, row["rel_path"])
         self.conn.execute(
@@ -396,10 +396,11 @@ class ManifestDB:
         # A delayed USN delete for an atomically replaced file must not retire
         # the new file that now occupies the same relative path.
         if row["is_dir"] and (not replacement or replacement["file_id"] == file_id):
-            key = path_key(row["rel_path"])
+            prefix = path_key(row["rel_path"]) + "\\"
             self.conn.execute(
-                "UPDATE nodes SET present=0,last_seen=? WHERE side=? AND path_key LIKE ?",
-                (utc_now(), side, key + "\\%"),
+                "UPDATE nodes SET present=0,last_seen=? "
+                "WHERE side=? AND present=1 AND path_key>=? AND path_key<?",
+                (utc_now(), side, prefix, prefix + "\U0010ffff"),
             )
 
     def mark_missing_path(self, side: str, rel: str, is_dir: bool) -> None:
@@ -409,9 +410,11 @@ class ManifestDB:
             (utc_now(), side, key),
         )
         if is_dir and rel:
+            prefix = key + "\\"
             self.conn.execute(
-                "UPDATE nodes SET present=0,last_seen=? WHERE side=? AND path_key LIKE ?",
-                (utc_now(), side, key + "\\%"),
+                "UPDATE nodes SET present=0,last_seen=? "
+                "WHERE side=? AND present=1 AND path_key>=? AND path_key<?",
+                (utc_now(), side, prefix, prefix + "\U0010ffff"),
             )
 
     def by_file_id(self, side: str, file_id: int) -> sqlite3.Row | None:
@@ -542,6 +545,12 @@ class ManifestDB:
                         raise RuntimeError(f"Hard links are not supported safely: {item}")
                     self.upsert_path(side, root, item)
                     count += 1
+                    if count % 10_000 == 0:
+                        logging.info(
+                            "Source subtree scan progress: %s (%d entries)",
+                            subtree,
+                            count,
+                        )
                 except FileNotFoundError:
                     continue
         return count
@@ -824,15 +833,33 @@ class MirrorEngine:
                 self._mark_journal_gap(side)
                 return True
             total_records = 0
+            batch_start_usn = int(stored_usn)
             try:
                 for next_usn, records in journal.record_batches(
                     int(stored_usn), state.journal_id
                 ):
-                    for record in records:
+                    logging.info(
+                        "Processing source USN batch: %d records (checkpoint %d -> %d)",
+                        len(records),
+                        batch_start_usn,
+                        next_usn,
+                    )
+                    last_record_progress = time.monotonic()
+                    for record_index, record in enumerate(records, start=1):
                         self._apply_usn(side, root, record)
+                        now = time.monotonic()
+                        if now - last_record_progress >= 10:
+                            logging.info(
+                                "Source USN batch progress: %d/%d records (current: %s)",
+                                record_index,
+                                len(records),
+                                record.name,
+                            )
+                            last_record_progress = now
                     self.db.conn.commit()
                     self.db.set_meta(f"{side}_next_usn", str(next_usn))
                     total_records += len(records)
+                    batch_start_usn = next_usn
                     if total_records and total_records % 100_000 < len(records):
                         logging.info("Ingested %d USN records for %s...", total_records, side)
             except OSError as exc:
@@ -885,6 +912,9 @@ class MirrorEngine:
                 if (record.attributes & FILE_ATTRIBUTE_DIRECTORY) and existing is None:
                     # A populated directory may have moved into the configured
                     # root without one USN record per child. Scan only this tree.
+                    logging.info(
+                        "Scanning newly discovered source subtree: %s", absolute
+                    )
                     count = self.db.scan_subtree(
                         side,
                         root,
@@ -1009,13 +1039,17 @@ class MirrorEngine:
         return actions
 
     def sync(self) -> dict[str, int]:
+        logging.info("Synchronization started")
         self._ensure_initialized()
+        logging.info("Validating source and replica identities...")
         self._validate_roots()
+        logging.info("Validating managed replica state...")
         self._initialize_managed_replica_state()
         if self.db.get_meta("reconcile_required") == "1":
             self.reconcile()
             self.db.set_meta("reconcile_required", "0")
         else:
+            logging.info("Reading source USN changes...")
             self.ingest_journals()
             if self.db.get_meta("reconcile_required") == "1":
                 self.reconcile()
